@@ -1,22 +1,114 @@
-with 
- 
-giving as ( 
-select  c.id_number, 
-        to_char(add_months(c.date_of_record, 6),'YYYY') as FY, 
-        sum(credit_amount) as credit 
-from    bi.calc_donor c         
-where   c.calculation = 'CO' 
-and     c.id_number = '0000000000'                          --ADD ID NUMBER
-group by    c.id_number, 
-            to_char(add_months(date_of_record, 6),'YYYY')  
-order by    c.id_number, 
-            to_char(add_months(date_of_record, 6),'YYYY')              
-) 
-select t.*, count(*) over (partition by id_number, grp order by fy) as consecutive_years  
-from ( 
-    select  t.id_number, t.fy,  
-            row_number() over (partition by id_number order by fy) as aa, 
-            fy - row_number() over (partition by id_number order by fy) as grp 
-    from    giving t 
-    ) t 
- 
+/*
+This sets up the test IDs for this calculation, selecting the most recent five fiscal years and the entities used in the CRM validation
+This can be swapped out for the population in the table
+*/
+with fy as
+      (
+            select
+                  to_char(sysdate,'YYYY')-level+1 fy ,
+                  'X'                             joinon -- this allows linking to other parts of the query
+            from
+                  dual connect by level <= 5) ,
+      id_fy as
+      (
+            select
+                  char_key id_number ,
+                  fy.fy
+            from
+                  advance.list_detail
+            join
+                  fy
+            on
+                  joinon = 'X'
+            where
+                  list_id = '38814')
+      /*
+      Currently only calculating university cash giving, not program-specific
+      This identifies past cash giving years by donor in a way that enables calculating consecutive and lapsed years
+      */
+      ,
+      cash as
+      (
+            select
+                  g.gift_donor_id id_number           ,
+                  a.fy                                ,
+                  g.gift_year_of_giving year_of_giving,
+                  /*This calculates how many years from the CFY the year of giving is, assuming the CFY is 1.  This allows comparisons between these values and the row numbers to look for gaps in giving*/
+                  a.fy - g.gift_year_of_giving yrs_from_fy,
+                  /*Row numbers counting back that start from the current fiscal year, previous fiscal year, and the year before that.  These allow LY/SY/Lapsed calculations for the respective years*/
+                  row_number() over
+                                    (
+                                          partition by g.gift_donor_id,
+                                                a.fy
+                                          order by g.gift_year_of_giving desc
+                                    )
+                                                    rn_fy,
+                  sum(g.gift_associated_credit_amt) soft
+            from
+                  gift g
+            join
+                  id_fy a
+            on
+                  a.id_number           = g.gift_donor_id
+            and   g.gift_year_of_giving < a.fy
+            where
+                  g.gift_transaction_type not in ('TR',
+                                                  'NG',
+                                                  'EX',
+                                                  'FT',
+                                                  'CR')
+            and   g.gift_associated_code not in ('H',
+                                                 'M')
+            and   g.gift_associated_credit_amt > 0
+            group by
+                  g.gift_donor_id      ,
+                  g.gift_year_of_giving,
+                  a.fy
+            order by
+                  g.gift_donor_id,
+                  a.fy           ,
+                  g.gift_year_of_giving desc)
+select
+      id_number,
+      fy       ,
+      nvl(max(
+            case
+            when
+                  yrs_from_fy = rn_fy
+            then
+                  year_of_giving
+            end) -min(
+            case
+            when
+                  yrs_from_fy = rn_fy
+            then
+                  year_of_giving
+            end) ,0) consec,
+      fy - nvl( max(
+            case
+            when
+                  (yrs_from_fy = rn_fy)
+                  and rn_fy = 1
+            then
+                  fy -1 -- zero out LY donors
+            end) , max(
+            case
+            when
+                  (yrs_from_fy <> rn_fy)
+            then
+                  year_of_giving
+            end)) - 1 lapsed,
+      max(nvl(
+            case
+            when
+                  yrs_from_fy = 2
+            then
+                  soft
+            end,
+            case
+            when
+                  yrs_from_fy = 3
+            then
+                  soft
+            end))           prior_cash,
+      count(year_of_giving) ttl_years_of_giving
